@@ -9,8 +9,6 @@
 
 enabled_site_setting :logto_mobile_session_enabled
 
-gem 'jwt', '2.7.1'
-
 after_initialize do
   # Validate OIDC prerequisite
   unless SiteSetting.openid_connect_enabled
