@@ -1,0 +1,9 @@
+en:
+  site_settings:
+    logto_mobile_session_enabled: "Enable Logto mobile session exchange"
+    logto_mobile_session_validation_method: "Token validation method"
+    logto_mobile_session_cookie_ttl: "Session cookie time-to-live (seconds)"
+    logto_mobile_session_auto_approve_users: "Automatically approve new users"
+    logto_mobile_session_require_verified_email: "Require verified email from Logto"
+    logto_mobile_session_allowed_client_types: "Allowed mobile client types"
+    logto_mobile_session_rate_limit_per_minute: "Rate limit (requests per minute)"

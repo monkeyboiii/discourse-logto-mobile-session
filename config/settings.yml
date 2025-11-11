@@ -1,0 +1,47 @@
+plugins:
+  logto_mobile_session_enabled:
+    default: false
+    client: false
+    description: "Enable Logto mobile session exchange endpoint"
+  
+  logto_mobile_session_validation_method:
+    default: "userinfo"
+    type: enum
+    choices:
+      - userinfo
+      - jwt
+    client: false
+    description: "Token validation method: 'userinfo' (call Logto API) or 'jwt' (local signature validation)"
+  
+  logto_mobile_session_cookie_ttl:
+    default: 86400
+    type: integer
+    min: 3600
+    max: 2592000
+    client: false
+    description: "Session cookie time-to-live in seconds (default 24 hours)"
+  
+  logto_mobile_session_auto_approve_users:
+    default: true
+    client: false
+    description: "Automatically approve users created via mobile session exchange"
+  
+  logto_mobile_session_require_verified_email:
+    default: true
+    client: false
+    description: "Only allow users with verified emails from Logto"
+  
+  logto_mobile_session_allowed_client_types:
+    default: "ios_native,android_native"
+    type: list
+    list_type: compact
+    client: false
+    description: "Comma-separated list of allowed client types"
+  
+  logto_mobile_session_rate_limit_per_minute:
+    default: 10
+    type: integer
+    min: 1
+    max: 100
+    client: false
+    description: "Maximum token exchange requests per IP per minute"

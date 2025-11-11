@@ -1,0 +1,9 @@
+zh_CN:
+  site_settings:
+    logto_mobile_session_enabled: "启用 Logto 移动端会话交换"
+    logto_mobile_session_validation_method: "令牌验证方法"
+    logto_mobile_session_cookie_ttl: "会话 Cookie 有效期（秒）"
+    logto_mobile_session_auto_approve_users: "自动批准新用户"
+    logto_mobile_session_require_verified_email: "要求 Logto 验证邮箱"
+    logto_mobile_session_allowed_client_types: "允许的移动客户端类型"
+    logto_mobile_session_rate_limit_per_minute: "速率限制（每分钟请求数）"
