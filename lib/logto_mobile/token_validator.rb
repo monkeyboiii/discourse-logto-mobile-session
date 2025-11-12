@@ -115,10 +115,10 @@ module LogtoMobile
       }
     rescue JWT::ExpiredSignature
       { success: false, error: 'expired_token', message: 'Token has expired' }
-    rescue JWT::DecodeError, JWT::VerificationError => e
-      { success: false, error: 'invalid_token', message: "JWT validation failed: #{e.message}" }
     rescue JWT::InvalidIssuerError
       { success: false, error: 'invalid_issuer', message: 'Token issuer does not match Logto' }
+    rescue JWT::DecodeError, JWT::VerificationError => e
+      { success: false, error: 'invalid_token', message: "JWT validation failed: #{e.message}" }
     rescue StandardError => e
       { success: false, error: 'jwt_validation_failed', message: e.message }
     end
@@ -157,6 +157,7 @@ module LogtoMobile
       end
     end
 
+    # TODO: Extract as standalone class with more custom logic, taking tests into account
     # Normalize user info to consistent format
     def normalize_user_info(user_info)
       raw_email = user_info['email']&.strip
