@@ -9,6 +9,15 @@
 
 enabled_site_setting :logto_mobile_session_enabled
 
+# Define plugin namespace early so files loaded before initialization can reference it
+module ::LogtoMobile
+  PLUGIN_NAME = "discourse-logto-mobile-session"
+
+  class Error < StandardError; end
+  class ValidationError < Error; end
+  class ProvisioningError < Error; end
+end
+
 after_initialize do
   # Validate OIDC prerequisite
   unless SiteSetting.openid_connect_enabled
@@ -20,15 +29,6 @@ after_initialize do
   require_relative 'lib/logto_mobile/user_provisioner'
   require_relative 'lib/logto_mobile/session_manager'
   require_relative 'app/controllers/logto_mobile/session_controller'
-
-  # Define plugin namespace
-  module ::LogtoMobile
-    PLUGIN_NAME = "discourse-logto-mobile-session"
-    
-    class Error < StandardError; end
-    class ValidationError < Error; end
-    class ProvisioningError < Error; end
-  end
 
   # Add custom routes
   Discourse::Application.routes.append do
