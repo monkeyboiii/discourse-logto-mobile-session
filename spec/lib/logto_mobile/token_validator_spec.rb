@@ -87,6 +87,7 @@ describe LogtoMobile::TokenValidator do
 
     it 'enforces verified emails when the setting is enabled' do
       SiteSetting.logto_mobile_session_require_verified_email = true
+      # TODO: verify Logto actully behave like this
       body = {
         sub: 'logto-user',
         email: 'user@example.com',
@@ -156,6 +157,26 @@ describe LogtoMobile::TokenValidator do
       expect(result[:error]).to eq('invalid_token')
       expect(result[:message]).to include('bad signature')
     end
+
+    it 'returns invalid_issuer when issuer validation fails' do
+      allow(JWT).to receive(:decode).and_raise(JWT::InvalidIssuerError)
+
+      result = validator.validate_token('issuer-mismatch')
+
+      expect(result[:success]).to eq(false)
+      expect(result[:error]).to eq('invalid_issuer')
+      expect(result[:message]).to include('Token issuer does not match Logto')
+    end
+
+    it 'returns jwt_validation_failed for unexpected errors' do
+      allow(JWT).to receive(:decode).and_raise(StandardError, 'boom')
+
+      result = validator.validate_token('broken-jwt')
+
+      expect(result[:success]).to eq(false)
+      expect(result[:error]).to eq('jwt_validation_failed')
+      expect(result[:message]).to include('boom')
+    end
   end
 
   describe '#fetch_jwks' do
@@ -171,6 +192,7 @@ describe LogtoMobile::TokenValidator do
     end
 
     it 'caches JWKS responses until the TTL expires' do
+      # TODO: verify Logto actully behave like this
       jwks_body = { keys: [{ kid: 'kid-1' }] }.to_json
       http_response = build_http_response(klass: Net::HTTPOK, code: '200', body: jwks_body)
 

@@ -60,6 +60,9 @@ module LogtoMobile
       user.custom_fields['logto_email_verified'] = @user_info[:email_verified]
       user.save_custom_fields(true)
 
+      # REVIEW: TODO: May very much wait till later when actual user complains
+      # about incosistent email vs OpenID Coonect email.
+
       # Create associated account record for OIDC
       UserAssociatedAccount.create!(
         provider_name: 'oidc',
@@ -91,6 +94,7 @@ module LogtoMobile
         user.save!
       end
 
+      # TODO: More custome fields here
       # Update Logto fields
       user.custom_fields['logto_sub'] = @user_info[:sub]
       user.custom_fields['logto_email_verified'] = @user_info[:email_verified]

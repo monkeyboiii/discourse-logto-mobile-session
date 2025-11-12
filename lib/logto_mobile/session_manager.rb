@@ -20,6 +20,7 @@ module LogtoMobile
       # Determine cookie domain
       cookie_domain = extract_cookie_domain
 
+      # TODO: implement long-lived sessions later
       # Calculate expiration
       ttl_seconds = SiteSetting.logto_mobile_session_cookie_ttl
       expires_at = Time.now + ttl_seconds.seconds
