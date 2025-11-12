@@ -108,5 +108,16 @@ describe LogtoMobile::UserProvisioner do
       expect(user.username).to eq('user_abc12345')
       expect(Jobs).not_to have_received(:enqueue).with(:download_avatar_from_url, anything)
     end
+
+    it 'wraps ActiveRecord::RecordInvalid errors with ProvisioningError' do
+      record_invalid = ActiveRecord::RecordInvalid.new(User.new)
+      allow(provisioner).to receive(:find_existing_user).and_return(nil)
+      allow(provisioner).to receive(:create_new_user).and_raise(record_invalid)
+
+      expect { provisioner.provision }.to raise_error(
+        LogtoMobile::ProvisioningError,
+        /Failed to provision user/
+      )
+    end
   end
 end
