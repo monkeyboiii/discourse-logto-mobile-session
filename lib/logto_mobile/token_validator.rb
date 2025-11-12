@@ -35,7 +35,8 @@ module LogtoMobile
 
     # METHOD 1: Validate via Logto's /userinfo endpoint
     def validate_via_userinfo(access_token)
-      userinfo_endpoint = "#{@tenant_endpoint}/oidc/userinfo"
+      # TODO: fetch from discovery endpoint, cahce it
+      userinfo_endpoint = "#{@tenant_endpoint}/oidc/me"
       uri = URI(userinfo_endpoint)
 
       request = Net::HTTP::Get.new(uri)
