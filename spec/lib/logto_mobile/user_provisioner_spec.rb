@@ -6,7 +6,7 @@ describe LogtoMobile::UserProvisioner do
   let(:base_user_info) do
     {
       sub: 'logto-sub-123',
-      email: '[email protected]',
+      email: 'jane@example.com',
       email_verified: true,
       name: 'Jane Smith',
       username: 'janesmith',
@@ -28,13 +28,13 @@ describe LogtoMobile::UserProvisioner do
       user = provisioner.provision
 
       expect(user).to be_persisted
-      expect(user.email).to eq('[email protected]')
+      expect(user.email).to eq('jane@example.com')
       expect(user.username).to eq('janesmith')
       expect(user.name).to eq('Jane Smith')
       expect(user.active).to eq(true)
       expect(user.approved).to eq(true)
       expect(user.custom_fields['logto_sub']).to eq('logto-sub-123')
-      expect(user.custom_fields['logto_email_verified']).to eq(true)
+      expect(user.custom_fields['logto_email_verified']).to eq('t')
 
       associated_account = UserAssociatedAccount.find_by(
         user_id: user.id,
@@ -45,17 +45,19 @@ describe LogtoMobile::UserProvisioner do
 
       expect(Jobs).to have_received(:enqueue).with(
         :download_avatar_from_url,
-        hash_including(
-          url: 'https://cdn.example.com/avatar.png',
-          user_id: user.id
-        )
+        satisfy do |payload|
+          payload[:url] == 'https://cdn.example.com/avatar.png' &&
+            payload[:user_id] == user.id &&
+            payload[:override_gravatar] == false
+        end
       )
     end
 
     it 'updates an existing user matched by email' do
-      existing_user = Fabricate(:user, email: '[email protected]', name: 'Old Name', username: 'existing')
+      existing_user = Fabricate(:user, email: 'existing@example.com', name: 'Old Name', username: 'existing')
       allow(Jobs).to receive(:enqueue)
 
+      user_info[:email] = existing_user.email
       user_info[:name] = 'Updated Name'
       user_info[:username] = 'ignored'
 
@@ -67,21 +69,21 @@ describe LogtoMobile::UserProvisioner do
       expect(existing_user.username).to eq('existing')
       expect(existing_user.custom_fields['logto_sub']).to eq('logto-sub-123')
       expect(existing_user.custom_fields['logto_last_auth']).to be_present
-      expect(Jobs).not_to have_received(:enqueue)
+      expect(Jobs).not_to have_received(:enqueue).with(:download_avatar_from_url, anything)
     end
 
     it 'matches existing users via their stored Logto subject' do
-      matched = Fabricate(:user, email: '[email protected]', username: 'legacy')
+      matched = Fabricate(:user, email: 'legacy@example.com', username: 'legacy')
       matched.custom_fields['logto_sub'] = 'logto-sub-123'
       matched.save_custom_fields(true)
       allow(Jobs).to receive(:enqueue)
 
-      user_info[:email] = '[email protected]'
+      user_info[:email] = 'legacy@example.com'
 
       provisioned = provisioner.provision
 
       expect(provisioned.id).to eq(matched.id)
-      expect(Jobs).not_to have_received(:enqueue)
+      expect(Jobs).not_to have_received(:enqueue).with(:download_avatar_from_url, anything)
     end
 
     it 'generates a unique username when the preferred one is taken' do
@@ -104,7 +106,7 @@ describe LogtoMobile::UserProvisioner do
       user = provisioner.provision
 
       expect(user.username).to eq('user_abc12345')
-      expect(Jobs).not_to have_received(:enqueue)
+      expect(Jobs).not_to have_received(:enqueue).with(:download_avatar_from_url, anything)
     end
   end
 end

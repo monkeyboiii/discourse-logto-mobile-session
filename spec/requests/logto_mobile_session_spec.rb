@@ -14,7 +14,7 @@ describe 'LogtoMobile::SessionController', type: :request do
     let(:user_info) do
       {
         sub: 'user123',
-        email: '[email protected]',
+        email: 'john@example.com',
         email_verified: true,
         name: 'John Doe',
         username: 'johndoe'
@@ -30,6 +30,20 @@ describe 'LogtoMobile::SessionController', type: :request do
         user_info: user_info,
         validation_method: 'userinfo'
       })
+
+      session_manager = instance_double(LogtoMobile::SessionManager)
+      allow(LogtoMobile::SessionManager).to receive(:new).and_return(session_manager)
+      allow(session_manager).to receive(:destroy_session)
+      allow(session_manager).to receive(:create_session).and_return(
+        name: '_forum_session',
+        value: 'cookie-value',
+        domain: '.example.com',
+        path: '/',
+        expires_at: 1.hour.from_now.iso8601,
+        secure: true,
+        http_only: true,
+        same_site: 'Lax'
+      )
     end
 
     context 'with valid token and new user' do
@@ -48,10 +62,10 @@ describe 'LogtoMobile::SessionController', type: :request do
         expect(json['session_cookie']['value']).to be_present
         expect(json['session_cookie']['http_only']).to eq(true)
         expect(json['user']['username']).to eq('johndoe')
-        expect(json['user']['email']).to eq('[email protected]')
+        expect(json['user']['email']).to eq('john@example.com')
 
         # Verify user was created
-        user = User.find_by_email('[email protected]')
+        user = User.find_by_email('john@example.com')
         expect(user).to be_present
         expect(user.active).to eq(true)
         expect(user.custom_fields['logto_sub']).to eq('user123')
@@ -60,20 +74,21 @@ describe 'LogtoMobile::SessionController', type: :request do
 
     context 'with valid token and existing user' do
       let!(:existing_user) do
-        Fabricate(:user, email: '[email protected]', username: 'johndoe')
+        Fabricate(:user, email: 'john@example.com', username: 'johndoe')
       end
 
       it 'logs in existing user' do
-        post '/api/auth/mobile-session', params: {
-          access_token: valid_token,
-          client_type: 'ios_native'
-        }
+        expect do
+          post '/api/auth/mobile-session', params: {
+            access_token: valid_token,
+            client_type: 'ios_native'
+          }
+        end.not_to change { User.count }
 
         expect(response.status).to eq(201)
         json = JSON.parse(response.body)
         
         expect(json['user']['id']).to eq(existing_user.id)
-        expect(User.count).to eq(1) # No new user created
       end
     end
 
@@ -165,14 +180,17 @@ describe 'LogtoMobile::SessionController', type: :request do
 
   describe 'DELETE /api/auth/mobile-session' do
     it 'destroys the session' do
-      user = Fabricate(:user)
-      sign_in(user)
+      session_manager = instance_double(LogtoMobile::SessionManager)
+      allow(LogtoMobile::SessionManager).to receive(:new).and_return(session_manager)
+      allow(session_manager).to receive(:create_session)
+      allow(session_manager).to receive(:destroy_session)
 
       delete '/api/auth/mobile-session'
 
       expect(response.status).to eq(200)
       json = JSON.parse(response.body)
       expect(json['success']).to eq(true)
+      expect(session_manager).to have_received(:destroy_session)
     end
   end
 

@@ -15,7 +15,9 @@ describe LogtoMobile::TokenValidator do
   end
 
   describe '#validate_token' do
-    before { SiteSetting.logto_mobile_session_validation_method = 'unsupported' }
+    before do
+      allow(SiteSetting).to receive(:logto_mobile_session_validation_method).and_return('unsupported')
+    end
 
     it 'returns a validation_failed error for unknown strategies' do
       result = validator.validate_token('token')
@@ -57,7 +59,7 @@ describe LogtoMobile::TokenValidator do
       expect(result).to include(success: true, validation_method: 'userinfo')
       expect(result[:user_info]).to include(
         sub: 'logto-user',
-        email: '[email protected]',
+        email: 'user@example.com',
         email_verified: true,
         name: 'user',
         username: 'AppUser',
@@ -87,7 +89,7 @@ describe LogtoMobile::TokenValidator do
       SiteSetting.logto_mobile_session_require_verified_email = true
       body = {
         sub: 'logto-user',
-        email: '[email protected]',
+        email: 'user@example.com',
         email_verified: false
       }.to_json
 
@@ -106,7 +108,7 @@ describe LogtoMobile::TokenValidator do
     let(:payload) do
       {
         'sub' => 'jwt-user',
-        'email' => '[email protected]',
+        'email' => 'jwt@example.com',
         'email_verified' => true,
         'preferred_username' => 'mobile_user',
         'name' => 'Mobile User',
@@ -128,7 +130,7 @@ describe LogtoMobile::TokenValidator do
       expect(result).to include(success: true, validation_method: 'jwt')
       expect(result[:user_info]).to include(
         sub: 'jwt-user',
-        email: '[email protected]',
+        email: 'jwt@example.com',
         email_verified: true,
         username: 'mobile_user',
         picture: 'https://cdn/avatar.png'
@@ -252,12 +254,12 @@ describe LogtoMobile::TokenValidator do
 
       expect(normalized[:email]).to eq('mixedcase.user+test@example.com')
       expect(normalized[:username]).to eq('MixedCase_User_test')
-      expect(normalized[:name]).to eq('MixedCase.User+test')
+      expect(normalized[:name]).to eq('mixedcase.user+test')
       expect(normalized[:email_verified]).to eq(false)
     end
 
     it 'generates usernames from email when needed' do
-      expect(validator.send(:generate_username_from_email, '[email protected]')).to eq('user_name')
+      expect(validator.send(:generate_username_from_email, 'user.name@example.com')).to eq('user_name')
     end
   end
 

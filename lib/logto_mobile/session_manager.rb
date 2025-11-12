@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'addressable/uri'
+
 module LogtoMobile
   class SessionManager
     def initialize(controller)
@@ -13,7 +15,7 @@ module LogtoMobile
 
       # Get session cookie details
       session_cookie_name = '_forum_session'
-      session_cookie_value = @controller.cookies.encrypted[session_cookie_name]
+      session_cookie_value = @controller.request.cookie_jar.encrypted[session_cookie_name]
 
       # Determine cookie domain
       cookie_domain = extract_cookie_domain
@@ -42,19 +44,21 @@ module LogtoMobile
     private
 
     def extract_cookie_domain
-      # Use Discourse's configured cookie domain if set
-      if SiteSetting.respond_to?(:cookies_domain) && SiteSetting.cookies_domain.present?
-        return SiteSetting.cookies_domain
-      end
+      forced_domain = SiteSetting.force_hostname.presence
+      forced_domain ||= GlobalSetting.force_hostname if GlobalSetting.respond_to?(:force_hostname)
+      return forced_domain if forced_domain.present?
 
-      # Fall back to request host
       request = @controller.request
-      host = request.host
+      host = request&.host.presence || Discourse.current_hostname
 
-      # For production, use root domain (e.g., .example.com)
-      if Rails.env.production? && !host.match?(/localhost|127\.0\.0\.1/)
-        parts = host.split('.')
-        return ".#{parts.last(2).join('.')}" if parts.length >= 2
+      if Rails.env.production? && host.present? && host !~ /localhost|127\.0\.0\.1/
+        begin
+          domain = Addressable::URI.parse("https://#{host}").domain
+        rescue Addressable::URI::InvalidURIError
+          domain = nil
+        end
+
+        return ".#{domain}" if domain.present?
       end
 
       host

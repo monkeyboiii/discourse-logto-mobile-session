@@ -32,12 +32,10 @@ after_initialize do
 
   # Add custom routes
   Discourse::Application.routes.append do
-    namespace :api do
-      namespace :auth do
-        post 'mobile-session' => 'logto_mobile/session#create'
-        delete 'mobile-session' => 'logto_mobile/session#destroy'
-        get 'mobile-session/health' => 'logto_mobile/session#health'
-      end
+    scope "/api/auth", defaults: { format: :json } do
+      post "mobile-session" => "logto_mobile/session#create"
+      delete "mobile-session" => "logto_mobile/session#destroy"
+      get "mobile-session/health" => "logto_mobile/session#health"
     end
   end
 

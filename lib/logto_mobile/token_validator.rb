@@ -113,10 +113,10 @@ module LogtoMobile
         validation_method: 'jwt',
         expires_at: Time.at(payload['exp'])
       }
-    rescue JWT::DecodeError, JWT::VerificationError => e
-      { success: false, error: 'invalid_token', message: "JWT validation failed: #{e.message}" }
     rescue JWT::ExpiredSignature
       { success: false, error: 'expired_token', message: 'Token has expired' }
+    rescue JWT::DecodeError, JWT::VerificationError => e
+      { success: false, error: 'invalid_token', message: "JWT validation failed: #{e.message}" }
     rescue JWT::InvalidIssuerError
       { success: false, error: 'invalid_issuer', message: 'Token issuer does not match Logto' }
     rescue StandardError => e
@@ -159,18 +159,22 @@ module LogtoMobile
 
     # Normalize user info to consistent format
     def normalize_user_info(user_info)
+      raw_email = user_info['email']&.strip
+      normalized_email = raw_email&.downcase
+      derived_username = user_info['username'] || user_info['preferred_username']
+
       {
         sub: user_info['sub'],
-        email: user_info['email']&.downcase&.strip,
+        email: normalized_email,
         email_verified: user_info['email_verified'] == true,
-        name: user_info['name'] || user_info['email']&.split('@')&.first,
-        username: user_info['username'] || user_info['preferred_username'] || generate_username_from_email(user_info['email']),
+        name: user_info['name'] || normalized_email&.split('@')&.first,
+        username: derived_username || generate_username_from_email(raw_email),
         picture: user_info['picture']
       }
     end
 
     def generate_username_from_email(email)
-      return nil unless email
+      return nil if email.blank?
       email.split('@').first.gsub(/[^a-z0-9_-]/i, '_').slice(0, 20)
     end
 
