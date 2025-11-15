@@ -3,10 +3,48 @@
 require 'rails_helper'
 
 describe 'LogtoMobile::SessionController', type: :request do
+
+  let(:discovery_url) { "https://auth.example.com/oidc/.well-known/openid-configuration" }
+  let(:issuer) { "https://auth.example.com/oidc" }
+  let(:userinfo_endpoint) { "https://auth.example.com/oidc/me" }
+  let(:jwks_uri) { "https://auth.example.com/oidc/jwks" }
+
+  let(:discovery_document) do
+    {
+      "issuer" => issuer,
+      "userinfo_endpoint" => userinfo_endpoint,
+      "jwks_uri" => jwks_uri,
+      "token_endpoint" => "https://auth.example.com/oidc/token",
+      "id_token_signing_alg_values_supported" => ["ES384"],
+    }
+  end
+
+  let(:jwks_document) do
+    JSON.parse(
+      File.read("#{Rails.root}/plugins/discourse-logto-mobile-session/spec/fixtures/jwks.json"),
+    )
+  end  
+
   before do
-    SiteSetting.logto_mobile_session_enabled = true
+    stub_request(:get, discovery_url).to_return(
+      status: 200,
+      body: discovery_document.to_json,
+      headers: {
+        "Content-Type" => "application/json",
+      },
+    )
+  
+    stub_request(:get, discovery_document["jwks_uri"]).to_return(
+      status: 200,
+      body: jwks_document.to_json,
+      headers: {
+        "Content-Type" => "application/json",
+      },
+    )
+
     SiteSetting.openid_connect_enabled = true
-    SiteSetting.openid_connect_discovery_document = 'https://test.logto.app/oidc/.well-known/openid-configuration'
+    SiteSetting.logto_mobile_session_enabled = true
+    SiteSetting.openid_connect_discovery_document = discovery_url
   end
 
   describe 'POST /api/auth/mobile-session' do
