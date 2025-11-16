@@ -12,15 +12,7 @@ plugins:
       - jwt
     client: false
     description: "Token validation method: 'userinfo' (call Logto API) or 'jwt' (local signature validation)"
-  
-  logto_mobile_session_cookie_ttl:
-    default: 86400
-    type: integer
-    min: 3600
-    max: 2592000
-    client: false
-    description: "Session cookie time-to-live in seconds (default 24 hours)"
-  
+
   logto_mobile_session_auto_approve_users:
     default: true
     client: false

@@ -12,6 +12,7 @@ enabled_site_setting :logto_mobile_session_enabled
 # Define plugin namespace early so files loaded before initialization can reference it
 module ::LogtoMobile
   PLUGIN_NAME = "discourse-logto-mobile-session"
+  VERSION = "0.1.2"
 
   class Error < StandardError
   end
