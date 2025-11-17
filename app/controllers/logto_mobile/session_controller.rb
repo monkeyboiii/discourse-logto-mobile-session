@@ -82,7 +82,7 @@ module LogtoMobile
         oidc_enabled: SiteSetting.openid_connect_enabled,
         oidc_configured: SiteSetting.openid_connect_discovery_document.present?,
         validation_method: SiteSetting.logto_mobile_session_validation_method,
-        rate_limiting: defined?(RackAttack) ? true : "not_enabled",
+        rate_limiting: true,
       }
 
       all_healthy = checks.values.all? { |v| v == true || v.present? }
