@@ -1,23 +1,16 @@
-# Complete Implementation Guide: Discourse Mobile Session Exchange Plugin
+# discourse-logto-mobile-session
 
-## Executive Summary
+> AI Assistant Guide for Discourse Logto Mobile Session Plugin
 
-This guide provides production-ready code for a Discourse plugin that securely exchanges Logto OIDC access tokens for Discourse session cookies, enabling native mobile apps to authenticate users into WebView contexts. The implementation supports **two token validation methods** (feature-flag switchable), comprehensive security controls, and automatic user provisioning.
+## Overview
 
-**Core Capability:** POST an access token from your iOS app → Receive a session cookie → Inject into WebView → User is authenticated in Discourse forum.
+A Discourse plugin that enables native mobile apps to exchange Logto OIDC access tokens for Discourse session cookies, allowing seamless authentication transitions from native app context to WebView.
 
-## Architecture Overview
+**Version:** 0.1.2
+**Author:** monkeyboiii
+**Discourse Version Required:** 2.7.0+
 
-### Design Decision: Standalone Plugin
-
-The plugin is implemented as a **standalone module** that:
-
-- Reuses existing OIDC configuration from Discourse core (client ID, secret, discovery endpoint)
-- Adds custom API endpoints for mobile token exchange
-- Remains independent and maintainable without modifying core authentication
-- Validates OIDC is enabled as a prerequisite
-
-### Component Architecture
+### Core Flow
 
 ```
 Mobile App (Logto SDK) → Access Token
@@ -26,1107 +19,253 @@ POST /api/auth/mobile-session
          ↓
 Token Validation (userinfo OR JWT)
          ↓
-User Provisioning (if new)
+User Provisioning (find/create)
          ↓
-Discourse Session Creation (log_on_user)
+Session Creation (log_on_user)
          ↓
-Session Cookie Response → WebView
+Cookie Response (_t + _forum_session) → WebView
 ```
 
 ---
 
-## 1. Plugin File Structure
+## Architecture
+
+### Components
+
+1. **OidcMetadata** (`lib/logto_mobile/oidc_metadata.rb`) - ⭐ NEW KEY COMPONENT
+   - Centralized OIDC discovery document and JWKS fetching
+   - Redis-backed caching (10min for discovery, 1hr for JWKS)
+   - Automatic cache invalidation on setting changes
+   - Provides issuer, userinfo_endpoint, jwks_uri, algorithms
+
+2. **TokenValidator** (`lib/logto_mobile/token_validator.rb`)
+   - Validates tokens via userinfo endpoint OR JWT signature
+   - Uses OidcMetadata for all endpoints and keys
+   - Supports feature-flag switching between methods
+
+3. **UserProvisioner** (`lib/logto_mobile/user_provisioner.rb`)
+   - Finds users by email or logto_sub custom field
+   - Creates new users with auto-activation
+   - Stores Logto metadata in custom fields
+   - Creates UserAssociatedAccount for OIDC linking
+
+4. **SessionManager** (`lib/logto_mobile/session_manager.rb`)
+   - Creates Discourse sessions via `log_on_user`
+   - Returns BOTH cookies: `_t` (auth token) and `_forum_session`
+   - Uses Discourse native session settings (no custom TTL)
+   - Cookie domain from `force_hostname` or request host
+
+5. **SessionController** (`app/controllers/logto_mobile/session_controller.rb`)
+   - API endpoints: POST/DELETE /api/auth/mobile-session, GET /health
+   - Rate limiting, client type validation, error handling
+
+### File Structure
 
 ```
-plugins/discourse-logto-mobile-session/
-├── plugin.rb                                 # Main plugin manifest
+discourse-logto-mobile-session/
+├── plugin.rb                                      # Plugin manifest, routes, cache hooks
 ├── config/
-│   ├── settings.yml                          # Plugin configuration
+│   ├── settings.yml                               # Site settings (no cookie_ttl setting!)
 │   └── locales/
-│       └── server.en.yml                     # Translations
-├── app/
-│   └── controllers/
-│       └── logto_mobile/
-│           └── session_controller.rb         # API endpoint controller
-├── lib/
-│   ├── logto_mobile/
-│   │   ├── token_validator.rb               # Token validation service
-│   │   ├── user_provisioner.rb              # User creation/matching
-│   │   └── session_manager.rb               # Session cookie handling
-│   └── validators/
-│       └── oidc_enabled_validator.rb         # Prerequisites check
+│       ├── server.en.yml                          # English translations
+│       └── server.zh_CN.yml                       # Chinese translations
+├── lib/logto_mobile/
+│   ├── oidc_metadata.rb                           # ⭐ OIDC discovery/JWKS caching service
+│   ├── token_validator.rb                        # Token validation (userinfo/JWT)
+│   ├── user_provisioner.rb                       # User creation/matching
+│   └── session_manager.rb                        # Session/cookie handling
+├── app/controllers/logto_mobile/
+│   └── session_controller.rb                     # API controller
 └── spec/
+    ├── fixtures/
+    │   ├── openid-configuration.json              # Mock discovery document
+    │   └── jwks.json                              # Mock JWKS
+    ├── lib/logto_mobile/
+    │   ├── oidc_metadata_spec.rb
+    │   ├── token_validator_spec.rb
+    │   ├── user_provisioner_spec.rb
+    │   └── session_manager_spec.rb
     └── requests/
-        └── logto_mobile_session_spec.rb      # Integration tests
+        └── logto_mobile_session_spec.rb           # Integration tests
 ```
 
 ---
 
-## 2. Plugin Manifest (plugin.rb)
+## Key Implementation Details
+
+### 1. OIDC Metadata Service (OidcMetadata)
+
+**CRITICAL:** This module was added in recent commits and is NOT in older documentation.
+
+- Fetches discovery document from `SiteSetting.openid_connect_discovery_document`
+- Caches in Discourse.cache with TTLs (discovery: 10min, JWKS: 1hr)
+- Used by TokenValidator to get endpoints and keys
+- Auto-refreshes on `site_setting_changed` events
+- Validates required fields: issuer, jwks_uri, userinfo_endpoint
+
+**Cache Keys:**
+- `logto_mobile:oidc_discovery`
+- `logto_mobile:jwks`
+
+**Event Hook in plugin.rb:**
+```ruby
+on(:site_setting_changed) do |setting_name, old_value, new_value|
+  case setting_name
+  when :logto_mobile_session_enabled, :openid_connect_discovery_document,
+       :logto_mobile_session_validation_method
+    LogtoMobile::OidcMetadata.refresh_all!
+  end
+end
+```
+
+### 2. Token Validation Methods
+
+**Userinfo Method** (default):
+- Calls Logto's userinfo endpoint with Bearer token
+- Returns user claims directly
+- Simpler but requires external HTTP call
+
+**JWT Method**:
+- Validates signature using JWKS from OidcMetadata
+- Supports multiple algorithms (derived from JWKS or discovery doc)
+- Faster, no external call after JWKS cached
+- Falls back to RS256 if no algorithm specified
+
+**Algorithm Detection:**
+1. First tries to extract from JWKS keys (`alg` field)
+2. Falls back to discovery doc's `id_token_signing_alg_values_supported`
+3. Defaults to `["RS256"]`
+
+### 3. Session Cookie Handling
+
+**IMPORTANT CHANGE:** Returns TWO cookies, not one!
 
 ```ruby
-# frozen_string_literal: true
-
-# name: discourse-logto-mobile-session
-# about: Exchange Logto OIDC access tokens for Discourse session cookies (Phase 1 mobile auth)
-# version: 1.0.0
-# authors: Your Organization
-# url: https://github.com/yourorg/discourse-logto-mobile-session
-# required_version: 2.7.0
-
-enabled_site_setting :logto_mobile_session_enabled
-
-gem 'jwt', '2.7.1'
-
-after_initialize do
-  # Validate OIDC prerequisite
-  unless SiteSetting.openid_connect_enabled
-    Rails.logger.warn "[LogtoMobileSession] OpenID Connect must be enabled for mobile session exchange"
-  end
-
-  # Load dependencies
-  require_relative 'lib/logto_mobile/token_validator'
-  require_relative 'lib/logto_mobile/user_provisioner'
-  require_relative 'lib/logto_mobile/session_manager'
-  require_relative 'app/controllers/logto_mobile/session_controller'
-
-  # Define plugin namespace
-  module ::LogtoMobile
-    PLUGIN_NAME = "discourse-logto-mobile-session"
-    
-    class Error < StandardError; end
-    class ValidationError < Error; end
-    class ProvisioningError < Error; end
-  end
-
-  # Add custom routes
-  Discourse::Application.routes.append do
-    namespace :api do
-      namespace :auth do
-        post 'mobile-session' => 'logto_mobile/session#create'
-        delete 'mobile-session' => 'logto_mobile/session#destroy'
-        get 'mobile-session/health' => 'logto_mobile/session#health'
-      end
-    end
-  end
-
-  # Add rate limiting for mobile session endpoint
-  if defined?(RackAttack)
-    Rack::Attack.throttle('mobile_session/ip', limit: 10, period: 1.minute) do |req|
-      req.ip if req.path == '/api/auth/mobile-session' && req.post?
-    end
-  end
-end
-```
-
----
-
-## 3. Configuration Settings (config/settings.yml)
-
-```yaml
-plugins:
-  logto_mobile_session_enabled:
-    default: false
-    client: false
-    description: "Enable Logto mobile session exchange endpoint"
-  
-  logto_mobile_session_validation_method:
-    default: "userinfo"
-    type: enum
-    choices:
-      - userinfo
-      - jwt
-    client: false
-    description: "Token validation method: 'userinfo' (call Logto API) or 'jwt' (local signature validation)"
-  
-  logto_mobile_session_cookie_ttl:
-    default: 86400
-    type: integer
-    min: 3600
-    max: 2592000
-    client: false
-    description: "Session cookie time-to-live in seconds (default 24 hours)"
-  
-  logto_mobile_session_auto_approve_users:
-    default: true
-    client: false
-    description: "Automatically approve users created via mobile session exchange"
-  
-  logto_mobile_session_require_verified_email:
-    default: true
-    client: false
-    description: "Only allow users with verified emails from Logto"
-  
-  logto_mobile_session_allowed_client_types:
-    default: "ios_native,android_native"
-    type: list
-    list_type: compact
-    client: false
-    description: "Comma-separated list of allowed client types"
-  
-  logto_mobile_session_rate_limit_per_minute:
-    default: 10
-    type: integer
-    min: 1
-    max: 100
-    client: false
-    description: "Maximum token exchange requests per IP per minute"
-```
-
----
-
-## 4. Token Validation Service (lib/logto_mobile/token_validator.rb)
-
-```ruby
-# frozen_string_literal: true
-
-module LogtoMobile
-  class TokenValidator
-    require 'net/http'
-    require 'uri'
-    require 'json'
-    require 'jwt'
-
-    JWKS_CACHE_TTL = 3600 # 1 hour
-
-    def initialize
-      @validation_method = SiteSetting.logto_mobile_session_validation_method
-      @tenant_endpoint = extract_tenant_endpoint
-      @jwks_cache = nil
-      @jwks_cached_at = nil
-    end
-
-    # Main validation entry point
-    def validate_token(access_token)
-      case @validation_method
-      when 'userinfo'
-        validate_via_userinfo(access_token)
-      when 'jwt'
-        validate_via_jwt(access_token)
-      else
-        raise ValidationError, "Invalid validation method: #{@validation_method}"
-      end
-    rescue StandardError => e
-      Rails.logger.error("[LogtoMobileSession] Token validation failed: #{e.message}")
-      { success: false, error: 'validation_failed', message: e.message }
-    end
-
-    private
-
-    # METHOD 1: Validate via Logto's /userinfo endpoint
-    def validate_via_userinfo(access_token)
-      userinfo_endpoint = "#{@tenant_endpoint}/oidc/userinfo"
-      uri = URI(userinfo_endpoint)
-
-      request = Net::HTTP::Get.new(uri)
-      request['Authorization'] = "Bearer #{access_token}"
-
-      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == 'https', read_timeout: 10) do |http|
-        http.request(request)
-      end
-
-      case response.code.to_i
-      when 200
-        user_info = JSON.parse(response.body)
-        validate_user_claims(user_info)
-        {
-          success: true,
-          user_info: normalize_user_info(user_info),
-          validation_method: 'userinfo'
-        }
-      when 401
-        { success: false, error: 'invalid_token', message: 'Token is invalid or expired' }
-      when 403
-        { success: false, error: 'insufficient_scope', message: 'Token lacks required permissions' }
-      else
-        { success: false, error: 'validation_failed', message: "HTTP #{response.code}" }
-      end
-    rescue Timeout::Error
-      { success: false, error: 'timeout', message: 'Logto userinfo endpoint timeout' }
-    rescue StandardError => e
-      { success: false, error: 'request_failed', message: e.message }
-    end
-
-    # METHOD 2: Validate via JWT signature using Logto's public keys
-    def validate_via_jwt(access_token)
-      issuer = "#{@tenant_endpoint}/oidc"
-      
-      # Create JWKS loader with caching and automatic refresh
-      jwk_loader = lambda do |options|
-        jwks_data = fetch_jwks(force_refresh: options[:invalidate])
-        jwks_data.deep_symbolize_keys
-      end
-
-      # Decode and verify JWT
-      decoded_token = JWT.decode(
-        access_token,
-        nil,
-        true, # Verify signature
-        {
-          algorithm: 'RS256',
-          iss: issuer,
-          verify_iss: true,
-          verify_aud: false, # May vary based on Logto config
-          verify_exp: true,
-          verify_iat: true,
-          jwks: jwk_loader
-        }
-      )
-
-      payload = decoded_token[0]
-      
-      # Convert JWT claims to userinfo format
-      user_info = {
-        'sub' => payload['sub'],
-        'email' => payload['email'],
-        'email_verified' => payload['email_verified'],
-        'name' => payload['name'],
-        'username' => payload['username'] || payload['preferred_username'],
-        'picture' => payload['picture']
-      }
-
-      validate_user_claims(user_info)
-
-      {
-        success: true,
-        user_info: normalize_user_info(user_info),
-        validation_method: 'jwt',
-        expires_at: Time.at(payload['exp'])
-      }
-    rescue JWT::DecodeError, JWT::VerificationError => e
-      { success: false, error: 'invalid_token', message: "JWT validation failed: #{e.message}" }
-    rescue JWT::ExpiredSignature
-      { success: false, error: 'expired_token', message: 'Token has expired' }
-    rescue JWT::InvalidIssuerError
-      { success: false, error: 'invalid_issuer', message: 'Token issuer does not match Logto' }
-    rescue StandardError => e
-      { success: false, error: 'jwt_validation_failed', message: e.message }
-    end
-
-    # Fetch JWKS from Logto with caching
-    def fetch_jwks(force_refresh: false)
-      if force_refresh || @jwks_cache.nil? || jwks_expired?
-        jwks_uri = "#{@tenant_endpoint}/oidc/jwks"
-        uri = URI(jwks_uri)
-        
-        response = Net::HTTP.get_response(uri)
-        raise ValidationError, "Failed to fetch JWKS: HTTP #{response.code}" unless response.is_a?(Net::HTTPSuccess)
-
-        @jwks_cache = JSON.parse(response.body)
-        @jwks_cached_at = Time.now
-        
-        Rails.logger.info("[LogtoMobileSession] JWKS refreshed from #{jwks_uri}")
-      end
-
-      @jwks_cache
-    end
-
-    def jwks_expired?
-      @jwks_cached_at.nil? || (Time.now - @jwks_cached_at) > JWKS_CACHE_TTL
-    end
-
-    # Validate required claims are present
-    def validate_user_claims(user_info)
-      raise ValidationError, "Missing 'sub' claim" unless user_info['sub'].present?
-      raise ValidationError, "Missing 'email' claim" unless user_info['email'].present?
-
-      if SiteSetting.logto_mobile_session_require_verified_email
-        unless user_info['email_verified'] == true
-          raise ValidationError, "Email not verified in Logto"
-        end
-      end
-    end
-
-    # Normalize user info to consistent format
-    def normalize_user_info(user_info)
-      {
-        sub: user_info['sub'],
-        email: user_info['email']&.downcase&.strip,
-        email_verified: user_info['email_verified'] == true,
-        name: user_info['name'] || user_info['email']&.split('@')&.first,
-        username: user_info['username'] || user_info['preferred_username'] || generate_username_from_email(user_info['email']),
-        picture: user_info['picture']
-      }
-    end
-
-    def generate_username_from_email(email)
-      return nil unless email
-      email.split('@').first.gsub(/[^a-z0-9_-]/i, '_').slice(0, 20)
-    end
-
-    # Extract tenant endpoint from OIDC discovery document setting
-    def extract_tenant_endpoint
-      discovery_url = SiteSetting.openid_connect_discovery_document
-      raise ValidationError, "OIDC discovery document not configured" unless discovery_url.present?
-
-      # Extract base URL from discovery document URL
-      # e.g., https://tenant.logto.app/oidc/.well-known/openid-configuration -> https://tenant.logto.app
-      uri = URI(discovery_url)
-      "#{uri.scheme}://#{uri.host}#{uri.port != uri.default_port ? ":#{uri.port}" : ''}"
-    end
-  end
-end
-
-# Extension for Hash deep symbolization
-class Hash
-  def deep_symbolize_keys
-    transform_keys(&:to_sym).transform_values do |value|
-      case value
-      when Hash
-        value.deep_symbolize_keys
-      when Array
-        value.map { |v| v.is_a?(Hash) ? v.deep_symbolize_keys : v }
-      else
-        value
-      end
-    end
-  end unless method_defined?(:deep_symbolize_keys)
-end
-```
-
----
-
-## 5. User Provisioning Service (lib/logto_mobile/user_provisioner.rb)
-
-```ruby
-# frozen_string_literal: true
-
-module LogtoMobile
-  class UserProvisioner
-    def initialize(user_info)
-      @user_info = user_info
-    end
-
-    # Find existing user or create new one
-    def provision
-      user = find_existing_user
-      
-      if user
-        Rails.logger.info("[LogtoMobileSession] Found existing user: #{user.username} (#{user.id})")
-        update_user_info(user)
-      else
-        user = create_new_user
-        Rails.logger.info("[LogtoMobileSession] Created new user: #{user.username} (#{user.id})")
-      end
-
-      user
-    rescue ActiveRecord::RecordInvalid => e
-      Rails.logger.error("[LogtoMobileSession] User provisioning failed: #{e.message}")
-      raise ProvisioningError, "Failed to provision user: #{e.message}"
-    end
-
-    private
-
-    def find_existing_user
-      # Match by email (primary identifier)
-      user = User.find_by_email(@user_info[:email])
-      return user if user
-
-      # Also check by custom field (Logto sub)
-      user_id = UserCustomField.where(name: 'logto_sub', value: @user_info[:sub]).first&.user_id
-      user_id ? User.find_by(id: user_id) : nil
-    end
-
-    def create_new_user
-      # Generate unique username
-      username = ensure_unique_username(@user_info[:username])
-
-      user = User.new(
-        email: @user_info[:email],
-        username: username,
-        name: @user_info[:name] || username,
-        active: true, # Auto-activate since Logto pre-verified
-        approved: SiteSetting.logto_mobile_session_auto_approve_users,
-        trust_level: TrustLevel[0],
-        staged: false
-      )
-
-      # Set a random secure password (user won't use it, always via OIDC)
-      user.password = SecureRandom.hex(32)
-
-      user.save!
-
-      # Store Logto identifier
-      user.custom_fields['logto_sub'] = @user_info[:sub]
-      user.custom_fields['logto_email_verified'] = @user_info[:email_verified]
-      user.save_custom_fields(true)
-
-      # Create associated account record for OIDC
-      UserAssociatedAccount.create!(
-        provider_name: 'oidc',
-        provider_uid: @user_info[:sub],
-        user_id: user.id,
-        extra: {
-          email: @user_info[:email],
-          name: @user_info[:name],
-          created_via: 'mobile_session_exchange'
-        }.to_json
-      )
-
-      # Set avatar if provided
-      if @user_info[:picture].present?
-        Jobs.enqueue(:download_avatar_from_url, 
-          url: @user_info[:picture], 
-          user_id: user.id,
-          override_gravatar: false
-        )
-      end
-
-      user
-    end
-
-    def update_user_info(user)
-      # Update name if changed
-      if @user_info[:name].present? && user.name != @user_info[:name]
-        user.name = @user_info[:name]
-        user.save!
-      end
-
-      # Update Logto fields
-      user.custom_fields['logto_sub'] = @user_info[:sub]
-      user.custom_fields['logto_email_verified'] = @user_info[:email_verified]
-      user.custom_fields['logto_last_auth'] = Time.now.iso8601
-      user.save_custom_fields(true)
-    end
-
-    def ensure_unique_username(base_username)
-      return generate_random_username if base_username.blank?
-
-      # Sanitize username
-      username = base_username.gsub(/[^a-z0-9_-]/i, '_').slice(0, 20)
-      
-      return username unless User.exists?(username: username)
-
-      # Append numbers until unique
-      counter = 1
-      loop do
-        candidate = "#{username}#{counter}"
-        return candidate unless User.exists?(username: candidate)
-        counter += 1
-        raise ProvisioningError, "Could not generate unique username" if counter > 100
-      end
-    end
-
-    def generate_random_username
-      "user_#{SecureRandom.hex(8)}"
-    end
-  end
-end
-```
-
----
-
-## 6. Session Manager (lib/logto_mobile/session_manager.rb)
-
-```ruby
-# frozen_string_literal: true
-
-module LogtoMobile
-  class SessionManager
-    def initialize(controller)
-      @controller = controller
-    end
-
-    # Create Discourse session for user and return cookie details
-    def create_session(user)
-      # Use Discourse's built-in session creation
-      @controller.log_on_user(user)
-
-      # Get session cookie details
-      session_cookie_name = '_forum_session'
-      session_cookie_value = @controller.cookies.encrypted[session_cookie_name]
-
-      # Determine cookie domain
-      cookie_domain = extract_cookie_domain
-
-      # Calculate expiration
-      ttl_seconds = SiteSetting.logto_mobile_session_cookie_ttl
-      expires_at = Time.now + ttl_seconds.seconds
-
-      {
-        name: session_cookie_name,
-        value: session_cookie_value,
-        domain: cookie_domain,
-        path: '/',
-        expires_at: expires_at.iso8601,
-        secure: Rails.env.production?,
-        http_only: true,
-        same_site: 'Lax'
-      }
-    end
-
-    # Destroy session
-    def destroy_session
-      @controller.log_off_user
-    end
-
-    private
-
-    def extract_cookie_domain
-      # Use Discourse's configured cookie domain if set
-      if SiteSetting.respond_to?(:cookies_domain) && SiteSetting.cookies_domain.present?
-        return SiteSetting.cookies_domain
-      end
-
-      # Fall back to request host
-      request = @controller.request
-      host = request.host
-
-      # For production, use root domain (e.g., .example.com)
-      if Rails.env.production? && !host.match?(/localhost|127\.0\.0\.1/)
-        parts = host.split('.')
-        return ".#{parts.last(2).join('.')}" if parts.length >= 2
-      end
-
-      host
-    end
-  end
-end
-```
-
----
-
-## 7. API Controller (app/controllers/logto_mobile/session_controller.rb)
-
-```ruby
-# frozen_string_literal: true
-
-module LogtoMobile
-  class SessionController < ::ApplicationController
-    requires_plugin 'discourse-logto-mobile-session'
-
-    skip_before_action :verify_authenticity_token, only: [:create, :destroy]
-    skip_before_action :redirect_to_login_if_required
-    skip_before_action :check_xhr, only: [:create, :destroy, :health]
-
-    before_action :check_plugin_enabled
-    before_action :check_oidc_enabled
-    before_action :validate_client_type, only: [:create]
-    before_action :check_rate_limit, only: [:create]
-
-    rescue_from LogtoMobile::ValidationError, with: :handle_validation_error
-    rescue_from LogtoMobile::ProvisioningError, with: :handle_provisioning_error
-    rescue_from StandardError, with: :handle_generic_error
-
-    def create
-      # Extract access token from request
-      access_token = extract_access_token
-
-      # Validate token with Logto
-      validation_result = token_validator.validate_token(access_token)
-
-      unless validation_result[:success]
-        return render json: {
-          error: validation_result[:error],
-          message: validation_result[:message]
-        }, status: :unauthorized
-      end
-
-      # Provision user (find or create)
-      provisioner = UserProvisioner.new(validation_result[:user_info])
-      user = provisioner.provision
-
-      # Create Discourse session
-      session_manager = SessionManager.new(self)
-      session_cookie = session_manager.create_session(user)
-
-      # Log successful authentication
-      log_authentication_event('mobile_session_created', user, validation_result[:validation_method])
-
-      # Return session cookie details
-      render json: {
-        success: true,
-        session_cookie: session_cookie,
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-          name: user.name,
-          avatar_url: user.avatar_template_url.gsub("{size}", "120")
-        },
-        validation_method: validation_result[:validation_method]
-      }, status: :created
-    end
-
-    def destroy
-      session_manager = SessionManager.new(self)
-      session_manager.destroy_session
-
-      log_authentication_event('mobile_session_destroyed', current_user, nil)
-
-      render json: { success: true, message: 'Session destroyed' }
-    end
-
-    def health
-      checks = {
-        plugin_enabled: SiteSetting.logto_mobile_session_enabled,
-        oidc_enabled: SiteSetting.openid_connect_enabled,
-        oidc_configured: SiteSetting.openid_connect_discovery_document.present?,
-        validation_method: SiteSetting.logto_mobile_session_validation_method,
-        rate_limiting: defined?(RackAttack)
-      }
-
-      all_healthy = checks.values.all? { |v| v == true || v.present? }
-
-      render json: {
-        healthy: all_healthy,
-        checks: checks,
-        version: '1.0.0'
-      }, status: all_healthy ? :ok : :service_unavailable
-    end
-
-    private
-
-    def check_plugin_enabled
-      unless SiteSetting.logto_mobile_session_enabled
-        render json: { error: 'Plugin not enabled' }, status: :service_unavailable
-      end
-    end
-
-    def check_oidc_enabled
-      unless SiteSetting.openid_connect_enabled
-        render json: { 
-          error: 'OIDC not enabled',
-          message: 'OpenID Connect must be enabled and configured'
-        }, status: :service_unavailable
-      end
-    end
-
-    def validate_client_type
-      client_type = params[:client_type]
-      
-      unless client_type.present?
-        return render json: { error: 'client_type required' }, status: :bad_request
-      end
-
-      allowed_types = SiteSetting.logto_mobile_session_allowed_client_types.split(',').map(&:strip)
-      
-      unless allowed_types.include?(client_type)
-        render json: { 
-          error: 'invalid_client_type',
-          message: "Client type '#{client_type}' not allowed"
-        }, status: :forbidden
-      end
-    end
-
-    def check_rate_limit
-      rate_limit_key = "mobile_session:#{request.ip}"
-      limit = SiteSetting.logto_mobile_session_rate_limit_per_minute
-      
-      if Discourse.redis.exists(rate_limit_key)
-        attempts = Discourse.redis.get(rate_limit_key).to_i
-        
-        if attempts >= limit
-          return render json: {
-            error: 'rate_limit_exceeded',
-            message: 'Too many requests. Please try again later.',
-            retry_after: Discourse.redis.ttl(rate_limit_key)
-          }, status: :too_many_requests
-        end
-      end
-
-      Discourse.redis.incr(rate_limit_key)
-      Discourse.redis.expire(rate_limit_key, 60)
-    end
-
-    def extract_access_token
-      access_token = params[:access_token]
-      
-      # Also support Authorization header
-      if access_token.blank? && request.headers['Authorization'].present?
-        auth_header = request.headers['Authorization']
-        access_token = auth_header.split(' ').last if auth_header.start_with?('Bearer ')
-      end
-
-      unless access_token.present?
-        raise ValidationError, "access_token is required"
-      end
-
-      access_token
-    end
-
-    def token_validator
-      @token_validator ||= TokenValidator.new
-    end
-
-    def log_authentication_event(event_type, user, validation_method)
-      # NEVER log actual tokens
-      Rails.logger.info({
-        event: event_type,
-        user_id: user&.id,
-        username: user&.username,
-        ip: request.ip,
-        user_agent: request.user_agent,
-        client_type: params[:client_type],
-        validation_method: validation_method,
-        timestamp: Time.now.iso8601
-      }.to_json)
-
-      # Also use Discourse's StaffActionLogger for admin visibility
-      if user && current_user&.staff?
-        StaffActionLogger.new(current_user).log_custom(
-          'mobile_session_exchange',
-          { user_id: user.id, validation_method: validation_method }
-        )
-      end
-    end
-
-    # Error handlers
-    def handle_validation_error(exception)
-      Rails.logger.warn("[LogtoMobileSession] Validation error: #{exception.message}")
-      render json: {
-        error: 'validation_error',
-        message: exception.message
-      }, status: :unauthorized
-    end
-
-    def handle_provisioning_error(exception)
-      Rails.logger.error("[LogtoMobileSession] Provisioning error: #{exception.message}")
-      render json: {
-        error: 'provisioning_error',
-        message: 'Failed to create or update user account'
-      }, status: :internal_server_error
-    end
-
-    def handle_generic_error(exception)
-      Rails.logger.error("[LogtoMobileSession] Unexpected error: #{exception.message}\n#{exception.backtrace.join("\n")}")
-      render json: {
-        error: 'internal_error',
-        message: 'An unexpected error occurred'
-      }, status: :internal_server_error
-    end
-  end
-end
-```
-
----
-
-## 8. Localization (config/locales/server.en.yml)
-
-```yaml
-en:
-  site_settings:
-    logto_mobile_session_enabled: "Enable Logto mobile session exchange"
-    logto_mobile_session_validation_method: "Token validation method"
-    logto_mobile_session_cookie_ttl: "Session cookie time-to-live (seconds)"
-    logto_mobile_session_auto_approve_users: "Automatically approve new users"
-    logto_mobile_session_require_verified_email: "Require verified email from Logto"
-    logto_mobile_session_allowed_client_types: "Allowed mobile client types"
-    logto_mobile_session_rate_limit_per_minute: "Rate limit (requests per minute)"
-```
-
----
-
-## 9. Testing Specification (spec/requests/logto_mobile_session_spec.rb)
-
-```ruby
-# frozen_string_literal: true
-
-require 'rails_helper'
-
-describe 'LogtoMobile::SessionController', type: :request do
-  before do
-    SiteSetting.logto_mobile_session_enabled = true
-    SiteSetting.openid_connect_enabled = true
-    SiteSetting.openid_connect_discovery_document = 'https://test.logto.app/oidc/.well-known/openid-configuration'
-  end
-
-  describe 'POST /api/auth/mobile-session' do
-    let(:valid_token) { 'valid_access_token_123' }
-    let(:user_info) do
-      {
-        sub: 'user123',
-        email: '[email protected]',
-        email_verified: true,
-        name: 'John Doe',
-        username: 'johndoe'
-      }
-    end
-
-    before do
-      # Mock token validator
-      validator = instance_double(LogtoMobile::TokenValidator)
-      allow(LogtoMobile::TokenValidator).to receive(:new).and_return(validator)
-      allow(validator).to receive(:validate_token).with(valid_token).and_return({
-        success: true,
-        user_info: user_info,
-        validation_method: 'userinfo'
-      })
-    end
-
-    context 'with valid token and new user' do
-      it 'creates user and returns session cookie' do
-        post '/api/auth/mobile-session', params: {
-          access_token: valid_token,
-          client_type: 'ios_native'
-        }
-
-        expect(response.status).to eq(201)
-        json = JSON.parse(response.body)
-        
-        expect(json['success']).to eq(true)
-        expect(json['session_cookie']).to be_present
-        expect(json['session_cookie']['name']).to eq('_forum_session')
-        expect(json['session_cookie']['value']).to be_present
-        expect(json['session_cookie']['http_only']).to eq(true)
-        expect(json['user']['username']).to eq('johndoe')
-        expect(json['user']['email']).to eq('[email protected]')
-
-        # Verify user was created
-        user = User.find_by_email('[email protected]')
-        expect(user).to be_present
-        expect(user.active).to eq(true)
-        expect(user.custom_fields['logto_sub']).to eq('user123')
-      end
-    end
-
-    context 'with valid token and existing user' do
-      let!(:existing_user) do
-        Fabricate(:user, email: '[email protected]', username: 'johndoe')
-      end
-
-      it 'logs in existing user' do
-        post '/api/auth/mobile-session', params: {
-          access_token: valid_token,
-          client_type: 'ios_native'
-        }
-
-        expect(response.status).to eq(201)
-        json = JSON.parse(response.body)
-        
-        expect(json['user']['id']).to eq(existing_user.id)
-        expect(User.count).to eq(1) # No new user created
-      end
-    end
-
-    context 'with invalid token' do
-      before do
-        validator = instance_double(LogtoMobile::TokenValidator)
-        allow(LogtoMobile::TokenValidator).to receive(:new).and_return(validator)
-        allow(validator).to receive(:validate_token).and_return({
-          success: false,
-          error: 'invalid_token',
-          message: 'Token is invalid'
-        })
-      end
-
-      it 'returns 401 unauthorized' do
-        post '/api/auth/mobile-session', params: {
-          access_token: 'invalid_token',
-          client_type: 'ios_native'
-        }
-
-        expect(response.status).to eq(401)
-        json = JSON.parse(response.body)
-        expect(json['error']).to eq('invalid_token')
-      end
-    end
-
-    context 'without access_token parameter' do
-      it 'returns 401 with validation error' do
-        post '/api/auth/mobile-session', params: {
-          client_type: 'ios_native'
-        }
-
-        expect(response.status).to eq(401)
-        json = JSON.parse(response.body)
-        expect(json['error']).to eq('validation_error')
-      end
-    end
-
-    context 'without client_type parameter' do
-      it 'returns 400 bad request' do
-        post '/api/auth/mobile-session', params: {
-          access_token: valid_token
-        }
-
-        expect(response.status).to eq(400)
-        json = JSON.parse(response.body)
-        expect(json['error']).to eq('client_type required')
-      end
-    end
-
-    context 'with disallowed client_type' do
-      it 'returns 403 forbidden' do
-        post '/api/auth/mobile-session', params: {
-          access_token: valid_token,
-          client_type: 'web_browser'
-        }
-
-        expect(response.status).to eq(403)
-        json = JSON.parse(response.body)
-        expect(json['error']).to eq('invalid_client_type')
-      end
-    end
-
-    context 'rate limiting' do
-      it 'blocks after exceeding limit' do
-        SiteSetting.logto_mobile_session_rate_limit_per_minute = 2
-
-        # First two requests should succeed
-        2.times do
-          post '/api/auth/mobile-session', params: {
-            access_token: valid_token,
-            client_type: 'ios_native'
-          }
-          expect(response.status).to eq(201)
-        end
-
-        # Third request should be rate limited
-        post '/api/auth/mobile-session', params: {
-          access_token: valid_token,
-          client_type: 'ios_native'
-        }
-        
-        expect(response.status).to eq(429)
-        json = JSON.parse(response.body)
-        expect(json['error']).to eq('rate_limit_exceeded')
-      end
-    end
-  end
-
-  describe 'DELETE /api/auth/mobile-session' do
-    it 'destroys the session' do
-      user = Fabricate(:user)
-      sign_in(user)
-
-      delete '/api/auth/mobile-session'
-
-      expect(response.status).to eq(200)
-      json = JSON.parse(response.body)
-      expect(json['success']).to eq(true)
-    end
-  end
-
-  describe 'GET /api/auth/mobile-session/health' do
-    it 'returns health status' do
-      get '/api/auth/mobile-session/health'
-
-      expect(response.status).to eq(200)
-      json = JSON.parse(response.body)
-      
-      expect(json['healthy']).to be_in([true, false])
-      expect(json['checks']).to be_present
-      expect(json['version']).to eq('1.0.0')
-    end
-  end
-end
-```
-
----
-
-## 10. Installation \u0026 Configuration Guide
-
-### Prerequisites
-
-1. **Self-hosted Discourse instance** (version 2.7.0+)
-2. **Logto tenant** with OIDC configured
-3. **OpenID Connect enabled** in Discourse
-4. **Redis** available (for rate limiting)
-
-### Step 1: Install Plugin
-
-**Via app.yml (Docker installation):**
-
-```yaml
-hooks:
-  after_code:
-    - exec:
-        cd: $home/plugins
-        cmd:
-          - git clone https://github.com/yourorg/discourse-logto-mobile-session.git
-```
-
-Rebuild container:
-```bash
-cd /var/discourse
-./launcher rebuild app
-```
-
-**Via development installation:**
-
-```bash
-cd discourse/plugins
-git clone https://github.com/yourorg/discourse-logto-mobile-session.git
-bundle install
-```
-
-### Step 2: Configure OpenID Connect
-
-Navigate to **Admin → Settings → Login** and configure:
-
-- **openid connect enabled**: ✓ Enabled
-- **openid connect discovery document**: `https://your-tenant.logto.app/oidc/.well-known/openid-configuration`
-- **openid connect client id**: Your Logto application client ID
-- **openid connect client secret**: Your Logto application client secret
-
-**Logto Configuration:**
-
-In your Logto application settings, add the redirect URI:
-```
-https://your-discourse-domain.com/auth/oidc/callback
-```
-
-### Step 3: Enable Mobile Session Plugin
-
-Navigate to **Admin → Settings → Plugins → discourse-logto-mobile-session**:
-
-- **logto mobile session enabled**: ✓ Enabled
-- **logto mobile session validation method**: `userinfo` (recommended for initial setup)
-- **logto mobile session cookie ttl**: `86400` (24 hours)
-- **logto mobile session auto approve users**: ✓ Enabled
-- **logto mobile session require verified email**: ✓ Enabled
-- **logto mobile session allowed client types**: `ios_native,android_native`
-- **logto mobile session rate limit per minute**: `10`
-
-### Step 4: Test Configuration
-
-**Health Check:**
-```bash
-curl https://your-discourse-domain.com/api/auth/mobile-session/health
-```
-
-Expected response:
-```json
 {
-  "healthy": true,
-  "checks": {
-    "plugin_enabled": true,
-    "oidc_enabled": true,
-    "oidc_configured": true,
-    "validation_method": "userinfo",
-    "rate_limiting": true
+  auth_token: {
+    name: "_t",
+    value: "...",  # Primary authentication token
+    domain: "forum.example.com",
+    path: "/",
+    expires_at: "2024-12-01T12:00:00Z",  # nil if non-persistent
+    secure: true,
+    http_only: true,
+    same_site: "Lax"
   },
-  "version": "1.0.0"
+  session_cookie: {
+    name: "_forum_session",
+    value: "...",  # Rails session cookie
+    # ... same structure
+  }
 }
 ```
 
-### Step 5: Test Token Exchange
+**Session Expiration:**
+- Uses Discourse's native `persistent_sessions` setting
+- If enabled: `maximum_session_age` hours from now
+- If disabled: nil (session cookie, expires when browser closes)
 
-**Obtain access token** from your iOS app using Logto SDK, then:
+**Cookie Domain Logic:**
+1. Check `SiteSetting.force_hostname`
+2. Check `GlobalSetting.force_hostname` (if available)
+3. Fall back to request host
+4. Returns FULL domain (e.g., `forum.example.com`), not apex (`.example.com`)
 
-```bash
-curl -X POST https://your-discourse-domain.com/api/auth/mobile-session \
-  -H "Content-Type: application/json" \
-  -d '{
-    "access_token": "YOUR_LOGTO_ACCESS_TOKEN",
-    "client_type": "ios_native"
-  }'
+### 4. Site Settings
+
+**Available Settings** (in config/settings.yml):
+
+```yaml
+logto_mobile_session_enabled: false                    # Master enable switch
+logto_mobile_session_validation_method: "userinfo"     # "userinfo" or "jwt"
+logto_mobile_session_auto_approve_users: true          # Auto-approve new users
+logto_mobile_session_require_verified_email: true      # Enforce email_verified claim
+logto_mobile_session_allowed_client_types: "ios_native,android_native"
+logto_mobile_session_rate_limit_per_minute: 10
 ```
 
-Expected response:
+**REMOVED from original docs:**
+- `logto_mobile_session_cookie_ttl` - Uses Discourse native session settings instead
+
+**Required External Settings:**
+- `openid_connect_enabled: true`
+- `openid_connect_discovery_document: "https://tenant.logto.app/oidc/.well-known/openid-configuration"`
+
+### 5. User Provisioning Logic
+
+**Matching Strategy:**
+1. First, search by email: `User.find_by_email(email)`
+2. If not found, search by custom field: `UserCustomField.where(name: 'logto_sub', value: sub)`
+
+**User Creation:**
+- Username: sanitized from Logto username → email-derived → random
+- Password: `SecureRandom.hex(32)` (user won't use it)
+- Active: `true` (Logto pre-verified)
+- Approved: based on `auto_approve_users` setting
+- Trust level: 0
+- Custom fields: `logto_sub`, `logto_email_verified`, `logto_last_auth`
+
+**Associated Account:**
+```ruby
+UserAssociatedAccount.create!(
+  provider_name: 'oidc',
+  provider_uid: user_info[:sub],
+  user_id: user.id,
+  extra: { email, name, created_via: 'mobile_session_exchange' }.to_json
+)
+```
+
+### 6. Rate Limiting
+
+**Implementation:** Redis-based, per-IP
+- Key: `mobile_session:#{request.ip}`
+- Default: 10 requests/minute
+- TTL: 60 seconds
+- Returns 429 with `retry_after` on exceed
+
+**Also uses Rack::Attack** (if available):
+```ruby
+Rack::Attack.throttle("mobile_session/ip", limit: 10, period: 1.minute) do |req|
+  req.ip if req.path == "/api/auth/mobile-session" && req.post?
+end
+```
+
+---
+
+## API Reference
+
+### POST /api/auth/mobile-session
+
+**Request:**
+```json
+{
+  "access_token": "eyJhbGc...",
+  "client_type": "ios_native"  // Required: must be in allowed_client_types
+}
+```
+
+OR with Bearer header:
+```
+Authorization: Bearer eyJhbGc...
+```
+
+**Success Response (201):**
 ```json
 {
   "success": true,
-  "session_cookie": {
-    "name": "_forum_session",
-    "value": "encrypted_session_value",
-    "domain": ".yourdomain.com",
+  "auth_token": {
+    "name": "_t",
+    "value": "...",
+    "domain": "forum.example.com",
     "path": "/",
     "expires_at": "2024-12-01T12:00:00Z",
     "secure": true,
     "http_only": true,
     "same_site": "Lax"
+  },
+  "session_cookie": {
+    "name": "_forum_session",
+    // ... same structure
   },
   "user": {
     "id": 123,
@@ -1135,374 +274,377 @@ Expected response:
     "name": "John Doe",
     "avatar_url": "https://..."
   },
-  "validation_method": "userinfo"
+  "validation_method": "jwt"
+}
+```
+
+**Error Responses:**
+- 400: Missing `client_type`
+- 401: Invalid/expired token, validation error
+- 403: Disallowed client type
+- 429: Rate limit exceeded
+- 503: Plugin or OIDC not enabled
+
+### DELETE /api/auth/mobile-session
+
+Destroys current session. Returns `{"success": true}`.
+
+### GET /api/auth/mobile-session/health
+
+**Response:**
+```json
+{
+  "healthy": true,
+  "checks": {
+    "plugin_enabled": true,
+    "oidc_enabled": true,
+    "oidc_configured": true,
+    "validation_method": "jwt",
+    "rate_limiting": true
+  },
+  "version": "0.1.2"
 }
 ```
 
 ---
 
-## 11. iOS Integration Example
+## Development Workflow
+
+### Running Tests
+
+```bash
+# From Discourse root
+bundle exec rspec plugins/discourse-logto-mobile-session/spec
+```
+
+**Test Structure:**
+- Unit tests: `spec/lib/logto_mobile/*_spec.rb`
+- Integration tests: `spec/requests/logto_mobile_session_spec.rb`
+- Fixtures: `spec/fixtures/*.json`
+
+**Key Test Patterns:**
+- Stub HTTP requests with WebMock
+- Clear Discourse.cache before/after
+- Stub discovery and JWKS endpoints BEFORE setting site settings (to handle refresh_all! hook)
+
+### Code Style
+
+- **Frozen string literals:** All files use `# frozen_string_literal: true`
+- **Formatting:** Uses Rubocop (Discourse standards)
+- **Namespacing:** All classes under `LogtoMobile` module
+- **Error handling:** Custom exceptions (`ValidationError`, `ProvisioningError`)
+- **Logging:** Prefix all logs with `[LogtoMobileSession]`
+
+### Recent Changes (Git History)
+
+- `cd5ab4c` - Cookie reimplementation + linting
+- `b41a180` - Fetch from OIDC discovery_url (OidcMetadata added)
+- `e09af93` - Hard-coded endpoint removal
+- `e80ec5d` - Session manager & controller review
+- `d1e2428` - Code review cleanup
+
+**Major Evolution:**
+1. Started with hard-coded endpoints
+2. Refactored to use discovery document
+3. Added centralized OidcMetadata service
+4. Implemented cookie handling improvements
+
+---
+
+## Common Patterns for AI Assistants
+
+### Adding New Features
+
+1. **Update OidcMetadata** if new OIDC endpoints needed
+2. **Add settings** to `config/settings.yml` + localizations
+3. **Write tests first** (TDD approach used in this codebase)
+4. **Update health check** in SessionController if new dependencies
+5. **Handle cache invalidation** in plugin.rb's `site_setting_changed` hook
+
+### Debugging Issues
+
+**Token validation failures:**
+- Check OidcMetadata.discovery! for discovery doc issues
+- Verify JWKS fetching: `OidcMetadata.fetch_jwks(force: true)`
+- Check algorithm detection: `OidcMetadata.algorithms`
+
+**Session cookie issues:**
+- Verify `force_hostname` setting
+- Check `persistent_sessions` and `maximum_session_age`
+- Confirm both `_t` and `_forum_session` cookies returned
+
+**User provisioning failures:**
+- Check email normalization (downcased, stripped)
+- Verify custom fields saved: `logto_sub`, `logto_email_verified`
+- Ensure UserAssociatedAccount created with provider_name: 'oidc'
+
+### Code Conventions
+
+**When modifying validators:**
+- Return hash with `:success`, `:error`, `:message` keys
+- Use symbolized keys in normalized user_info
+- Raise `ValidationError` for validation failures
+
+**When modifying provisioners:**
+- Match by email first, then logto_sub
+- Always update `logto_last_auth` custom field
+- Raise `ProvisioningError` for creation failures
+
+**When modifying controllers:**
+- Use rescue_from for custom error types
+- Never log access tokens (security!)
+- Return proper HTTP status codes
+- Include retry_after in rate limit responses
+
+**When modifying metadata service:**
+- Use Discourse.cache, not direct Redis
+- Include TTL on all cached data
+- Validate required fields from discovery doc
+- Use Faraday with FinalDestination::FaradayAdapter (Discourse pattern)
+
+### Testing Checklist
+
+- [ ] Unit tests for new service methods
+- [ ] Integration test for API endpoint changes
+- [ ] WebMock stubs for external HTTP calls
+- [ ] Cache clearing in before/after hooks
+- [ ] Test both validation methods (userinfo + JWT)
+- [ ] Test rate limiting scenarios
+- [ ] Test error handling paths
+- [ ] Update fixtures if OIDC response format changes
+
+---
+
+## Security Considerations
+
+### Implemented Protections
+
+1. **Rate Limiting:** 10 req/min per IP (configurable)
+2. **Client Type Validation:** Whitelist of allowed client types
+3. **Token Validation:** Via Logto (userinfo or JWT signature)
+4. **Email Verification:** Enforced via `require_verified_email` setting
+5. **HttpOnly Cookies:** Not accessible to JavaScript
+6. **Secure Flag:** HTTPS-only in production
+7. **SameSite=Lax:** CSRF protection
+8. **No Token Logging:** Access tokens never written to logs
+9. **CSRF Skip:** Only for API endpoints (skip_before_action :verify_authenticity_token)
+
+### Security Notes for AI Assistants
+
+- **NEVER log access tokens** - Use `[REDACTED]` or similar
+- **Validate all user inputs** - client_type, access_token params
+- **Use HTTPS in production** - Check `Rails.env.production?`
+- **Trust Logto for identity** - Don't bypass email_verified checks
+- **Audit custom fields** - `logto_sub` is the source of truth
+
+### Known TODOs in Code
+
+From `user_provisioner.rb:63-64`:
+```ruby
+# REVIEW: TODO: May very much wait till later when actual user complains
+# about inconsistent email vs OpenID Connect email.
+```
+
+From `user_provisioner.rb:97`:
+```ruby
+# TODO: More custom fields here
+```
+
+From `session_controller.rb:62`:
+```ruby
+# TODO: Should probably leave interpolation to the client
+avatar_url: user.avatar_template_url.gsub("{size}", "120")
+```
+
+---
+
+## Mobile Client Integration
+
+### iOS Example (Swift)
 
 ```swift
-import SwiftUI
-import WebKit
-import LogtoClient
+// 1. Get access token from Logto SDK
+let accessToken = try await logtoClient.getAccessToken()
 
-class DiscourseAuthManager {
-    let logtoClient: LogtoClient
-    let discourseAPIBase = "https://your-discourse-domain.com"
-    
-    init(logtoClient: LogtoClient) {
-        self.logtoClient = logtoClient
-    }
-    
-    // Exchange Logto token for Discourse session
-    func exchangeTokenForSession(completion: @escaping (Result<SessionCookie, Error>) -> Void) {
-        // Get access token from Logto
-        logtoClient.getAccessToken { result in
-            switch result {
-            case .success(let accessToken):
-                self.callMobileSessionAPI(accessToken: accessToken, completion: completion)
-            case .failure(let error):
-                completion(.failure(error))
-            }
-        }
-    }
-    
-    private func callMobileSessionAPI(accessToken: String, completion: @escaping (Result<SessionCookie, Error>) -> Void) {
-        let url = URL(string: "\(discourseAPIBase)/api/auth/mobile-session")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        let body: [String: Any] = [
-            "access_token": accessToken,
-            "client_type": "ios_native"
-        ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                completion(.failure(error))
-                return
-            }
-            
-            guard let data = data else {
-                completion(.failure(NSError(domain: "DiscourseAuth", code: -1)))
-                return
-            }
-            
-            do {
-                let decoder = JSONDecoder()
-                decoder.keyDecodingStrategy = .convertFromSnakeCase
-                let response = try decoder.decode(MobileSessionResponse.self, from: data)
-                completion(.success(response.sessionCookie))
-            } catch {
-                completion(.failure(error))
-            }
-        }.resume()
-    }
-    
-    // Inject session cookie into WKWebView
-    func configureWebView(_ webView: WKWebView, with sessionCookie: SessionCookie, completion: @escaping () -> Void) {
-        let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
-        
-        let cookie = HTTPCookie(properties: [
-            .name: sessionCookie.name,
-            .value: sessionCookie.value,
-            .domain: sessionCookie.domain,
-            .path: sessionCookie.path,
-            .secure: sessionCookie.secure,
-            .expires: ISO8601DateFormatter().date(from: sessionCookie.expiresAt) ?? Date()
-        ])!
-        
-        cookieStore.setCookie(cookie) {
-            completion()
-        }
-    }
-    
-    // Complete flow: authenticate and load forum
-    func loadAuthenticatedForum(in webView: WKWebView, completion: @escaping (Result<Void, Error>) -> Void) {
-        exchangeTokenForSession { result in
-            switch result {
-            case .success(let sessionCookie):
-                self.configureWebView(webView, with: sessionCookie) {
-                    let forumURL = URL(string: self.discourseAPIBase)!
-                    webView.load(URLRequest(url: forumURL))
-                    completion(.success(()))
-                }
-            case .failure(let error):
-                completion(.failure(error))
-            }
-        }
-    }
-}
+// 2. Exchange for Discourse session
+let response = try await exchangeToken(accessToken)
 
-// Data models
-struct MobileSessionResponse: Codable {
-    let success: Bool
-    let sessionCookie: SessionCookie
-    let user: DiscourseUser
-    let validationMethod: String
-}
+// 3. Inject both cookies into WKWebView
+let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
 
-struct SessionCookie: Codable {
-    let name: String
-    let value: String
-    let domain: String
-    let path: String
-    let expiresAt: String
-    let secure: Bool
-    let httpOnly: Bool
-    let sameSite: String
-}
+// Auth token cookie (_t)
+let authCookie = HTTPCookie(properties: [
+    .name: response.authToken.name,
+    .value: response.authToken.value,
+    .domain: response.authToken.domain,
+    .path: response.authToken.path,
+    .secure: response.authToken.secure,
+    .expires: ISO8601DateFormatter().date(from: response.authToken.expiresAt) ?? Date()
+])!
+await cookieStore.setCookie(authCookie)
 
-struct DiscourseUser: Codable {
-    let id: Int
-    let username: String
-    let email: String
-    let name: String
-    let avatarUrl: String
-}
+// Session cookie (_forum_session)
+let sessionCookie = HTTPCookie(properties: [
+    .name: response.sessionCookie.name,
+    .value: response.sessionCookie.value,
+    .domain: response.sessionCookie.domain,
+    .path: response.sessionCookie.path,
+    .secure: response.sessionCookie.secure,
+    .expires: ISO8601DateFormatter().date(from: response.sessionCookie.expiresAt) ?? Date()
+])!
+await cookieStore.setCookie(sessionCookie)
 
-// SwiftUI View Example
-struct ForumView: View {
-    @StateObject private var webViewStore = WebViewStore()
-    let authManager: DiscourseAuthManager
-    
-    var body: some View {
-        WebView(webView: webViewStore.webView)
-            .onAppear {
-                authManager.loadAuthenticatedForum(in: webViewStore.webView) { result in
-                    switch result {
-                    case .success:
-                        print("Forum loaded with authenticated session")
-                    case .failure(let error):
-                        print("Authentication failed: \(error)")
-                    }
-                }
-            }
-    }
-}
-
-class WebViewStore: ObservableObject {
-    let webView: WKWebView
-    
-    init() {
-        let config = WKWebViewConfiguration()
-        config.websiteDataStore = .nonPersistent() // Or .default() to persist
-        self.webView = WKWebView(frame: .zero, configuration: config)
-    }
-}
-
-struct WebView: UIViewRepresentable {
-    let webView: WKWebView
-    
-    func makeUIView(context: Context) -> WKWebView {
-        return webView
-    }
-    
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
-}
+// 4. Load forum
+webView.load(URLRequest(url: URL(string: "https://forum.example.com")!))
 ```
+
+**IMPORTANT:** Inject BOTH cookies (`_t` and `_forum_session`) for full authentication.
 
 ---
 
-## 12. Switching to JWT Validation
+## Configuration Checklist
 
-After initial testing with `userinfo` method, switch to JWT for better performance:
+### Discourse Admin Settings
 
-### Update Settings
+- [ ] **Login → openid connect enabled**: ✓
+- [ ] **Login → openid connect discovery document**: `https://tenant.logto.app/oidc/.well-known/openid-configuration`
+- [ ] **Login → openid connect client id**: Your Logto app ID
+- [ ] **Login → openid connect client secret**: Your Logto app secret
+- [ ] **Plugins → logto mobile session enabled**: ✓
+- [ ] **Plugins → logto mobile session validation method**: `userinfo` (start) → `jwt` (production)
+- [ ] **Plugins → logto mobile session allowed client types**: `ios_native,android_native`
+- [ ] **Plugins → logto mobile session rate limit per minute**: 10
 
-Navigate to **Admin → Settings → Plugins**:
-- **logto mobile session validation method**: Change to `jwt`
+### Logto Application Settings
 
-### Verify JWT Endpoint
+- [ ] **Redirect URI**: `https://forum.example.com/auth/oidc/callback`
+- [ ] **Allowed scopes**: `openid`, `profile`, `email`
+- [ ] **Token expiration**: 1 hour (recommended)
+- [ ] **Require email verification**: ✓ (if using require_verified_email)
 
-Ensure Logto's JWKS endpoint is accessible:
-```bash
-curl https://your-tenant.logto.app/oidc/jwks
-```
-
-Should return public keys:
-```json
-{
-  "keys": [
-    {
-      "kty": "RSA",
-      "use": "sig",
-      "kid": "abc123",
-      "n": "...",
-      "e": "AQAB",
-      "alg": "RS256"
-    }
-  ]
-}
-```
-
-### Test JWT Validation
-
-The endpoint behavior remains identical - validation happens server-side:
+### Environment Verification
 
 ```bash
-curl -X POST https://your-discourse-domain.com/api/auth/mobile-session \
-  -H "Content-Type: application/json" \
-  -d '{
-    "access_token": "YOUR_JWT_ACCESS_TOKEN",
-    "client_type": "ios_native"
-  }'
+# Health check
+curl https://forum.example.com/api/auth/mobile-session/health
+
+# Should return:
+# {"healthy": true, "checks": {...}, "version": "0.1.2"}
 ```
 
-Response should include `"validation_method": "jwt"`.
+---
 
-### Performance Benefits
+## Troubleshooting Guide
 
-- **Latency**: ~50-100ms faster (no external API call)
-- **Reliability**: Works even if Logto userinfo endpoint is temporarily down
-- **Scalability**: No outbound traffic per request
+### "OIDC discovery document not configured"
+
+**Cause:** `openid_connect_discovery_document` not set or invalid
+
+**Fix:**
+1. Set in Admin → Settings → Login
+2. Format: `https://tenant.logto.app/oidc/.well-known/openid-configuration`
+3. Check OidcMetadata.refresh_all! to clear cache
+
+### "Discovery document missing required fields"
+
+**Cause:** Discovery doc missing `issuer`, `jwks_uri`, or `userinfo_endpoint`
+
+**Fix:**
+1. Verify discovery URL is correct
+2. Test manually: `curl https://tenant.logto.app/oidc/.well-known/openid-configuration`
+3. Ensure Logto instance is properly configured
+
+### "JWT validation failed"
+
+**Cause:** Algorithm mismatch or JWKS fetch failure
+
+**Fix:**
+1. Check algorithms: `OidcMetadata.algorithms` should return non-empty array
+2. Verify JWKS accessible: `curl https://tenant.logto.app/oidc/jwks`
+3. Force refresh: `OidcMetadata.fetch_jwks(force: true)`
+4. Check token is from correct issuer
+
+### "Token is invalid or expired"
+
+**Cause:** Token expired, revoked, or from wrong tenant
+
+**Fix:**
+1. Verify token freshness (Logto default: 1hr expiration)
+2. Ensure token is for the correct Logto application
+3. Check token scopes include `openid`, `email`, `profile`
+4. Try userinfo method to see detailed error
+
+### "Email not verified in Logto"
+
+**Cause:** User's email not verified, setting enforces verification
+
+**Fix:**
+1. Verify user in Logto admin console
+2. OR disable: `logto_mobile_session_require_verified_email: false`
+
+### Session cookie not working in WebView
+
+**Cause:** Missing cookie, wrong domain, or security mismatch
+
+**Fix:**
+1. Ensure BOTH `_t` and `_forum_session` cookies injected
+2. Verify cookie domain matches WebView URL
+3. Check `secure` flag matches HTTPS usage
+4. Confirm cookie not expired
 
 ---
 
-## 13. Security Considerations
+## Localization
 
-### Multi-Account Protection
+**Supported Locales:**
+- English (`server.en.yml`)
+- Chinese Simplified (`server.zh_CN.yml`)
 
-**Risk**: User could obtain multiple tokens and create multiple accounts.
-
-**Mitigation**: The plugin matches users by:
-1. Email address (primary)
-2. Logto `sub` identifier (stored in custom fields)
-
-If email already exists, existing account is used. Logto should enforce unique emails.
-
-### Token Theft Prevention
-
-**Risk**: Stolen access token could be used to create sessions.
-
-**Mitigations Implemented:**
-- Rate limiting (10 requests/minute per IP)
-- Token validation via Logto (ensures token is valid and not revoked)
-- Short-lived tokens (Logto default: 1 hour)
-- Audit logging of all token exchanges
-- Client type validation
-
-**Additional Recommendations:**
-- Use PKCE in mobile app (Proof Key for Code Exchange)
-- Implement device fingerprinting
-- Monitor for anomalous patterns (multiple IPs using same token)
-
-### Session Hijacking Prevention
-
-**Mitigations Implemented:**
-- HttpOnly cookies (not accessible to JavaScript)
-- Secure flag (HTTPS only in production)
-- SameSite=Lax (CSRF protection)
-- Session expiration (24 hours default)
-
-### Privilege Escalation Prevention
-
-**Mitigations:**
-- New users start at Trust Level 0
-- Auto-approval can be disabled via settings
-- Email verification enforced via Logto
-- Staff accounts require manual approval
+**Adding New Locale:**
+1. Copy `config/locales/server.en.yml`
+2. Rename to `server.{locale}.yml`
+3. Translate `site_settings` strings
+4. Test in Discourse admin interface
 
 ---
 
-## 14. Monitoring \u0026 Debugging
+## Performance Notes
 
-### Log Monitoring
+### Caching Strategy
 
-Key events are logged in JSON format:
+- **Discovery Document:** 10 minutes (frequent enough for endpoint changes)
+- **JWKS:** 1 hour (keys rotate infrequently)
+- **Redis Keys:** Prefixed with `logto_mobile:` for easy identification
 
-```bash
-# Monitor mobile session exchanges
-tail -f /var/discourse/shared/standalone/log/rails/production.log | grep LogtoMobileSession
-```
+### Optimization Tips
 
-Example log entry:
-```json
-{
-  "event": "mobile_session_created",
-  "user_id": 123,
-  "username": "johndoe",
-  "ip": "203.0.113.45",
-  "user_agent": "MyApp/1.0 (iOS 17.0)",
-  "client_type": "ios_native",
-  "validation_method": "jwt",
-  "timestamp": "2024-11-10T15:30:00Z"
-}
-```
+1. **Use JWT validation** for production (eliminates userinfo HTTP call)
+2. **Monitor cache hit rates** in Redis
+3. **Adjust TTLs** in OidcMetadata if needed
+4. **Pre-warm cache** via `OidcMetadata.refresh_all!` on deploy
 
-### Admin Visibility
+### Scaling Considerations
 
-Navigate to **Admin → Logs → Staff Actions** to view:
-- Mobile session exchanges
-- User provisioning events
-- Failed authentication attempts
-
-### Common Issues
-
-**Issue**: "OIDC not enabled" error
-
-**Solution**: Enable OpenID Connect in Discourse settings and configure Logto discovery URL.
+- Rate limiting is per-IP, may need adjustment for NAT environments
+- JWKS cache shared across all app servers (Redis)
+- No persistent state in plugin (stateless)
 
 ---
 
-**Issue**: "Invalid token" with userinfo method
+## Version History
 
-**Solution**: 
-- Verify access token is not expired
-- Check Logto scopes include `openid`, `email`, `profile`
-- Ensure Logto API resource includes userinfo access
+- **0.1.2** - Current version (cookie improvements, linting)
+- **0.1.x** - OIDC metadata service, discovery integration
+- **0.0.x** - Initial implementation
 
----
+## Related Documentation
 
-**Issue**: JWT validation fails with "Invalid issuer"
-
-**Solution**: 
-- Verify OIDC discovery document URL is correct
-- Ensure it matches Logto tenant exactly
-- Check issuer in JWT matches `{tenant}/oidc`
+- [Discourse Plugin Development](https://meta.discourse.org/t/beginners-guide-to-creating-discourse-plugins/30515)
+- [Logto OIDC Documentation](https://docs.logto.io/docs/recipes/integrate-logto/)
+- [OpenID Connect Specification](https://openid.net/specs/openid-connect-core-1_0.html)
 
 ---
 
-**Issue**: User created but not approved
-
-**Solution**: Enable `logto_mobile_session_auto_approve_users` setting or manually approve in Admin → Users.
-
----
-
-## 15. Production Deployment Checklist
-
-- [ ] OIDC configured and tested in Discourse
-- [ ] Logto redirect URI includes Discourse callback URL
-- [ ] Plugin installed and enabled
-- [ ] Rate limiting configured appropriately
-- [ ] HTTPS/SSL certificate valid
-- [ ] Cookie domain configured correctly for your setup
-- [ ] JWT validation tested if using that method
-- [ ] JWKS endpoint accessible from Discourse server
-- [ ] Mobile app updated to use token exchange flow
-- [ ] Monitoring and alerting configured for auth failures
-- [ ] Backup plan for Logto outages (cached JWKS for JWT method)
-- [ ] Security review completed
-- [ ] Documentation provided to mobile developers
-- [ ] Load testing performed for expected traffic
-
----
-
-## Conclusion
-
-This implementation provides a **secure, performant, and maintainable** solution for bridging Logto authentication from native mobile apps into Discourse WebViews. The dual validation approach offers flexibility to start simple (userinfo) and optimize later (JWT), while comprehensive security controls protect against common attack vectors.
-
-**Key Advantages:**
-
-- **Zero token exposure to JavaScript** - Tokens stay server-side
-- **Feature-flagged validation** - Switch methods without code changes
-- **Automatic user provisioning** - Seamless user experience
-- **Production-grade security** - Rate limiting, audit logging, session protection
-- **OIDC configuration reuse** - No duplication of settings
-- **Comprehensive testing** - Full RSpec test suite included
-
-The plugin is production-ready and follows Discourse best practices for plugin development, security, and performance.
+**Last Updated:** 2024-11 (matches git commit cd5ab4c)
+**Maintainer:** monkeyboiii
+**Repository:** https://github.com/monkeyboiii/discourse-logto-mobile-session
