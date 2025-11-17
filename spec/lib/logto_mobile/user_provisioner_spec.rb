@@ -69,7 +69,18 @@ describe LogtoMobile::UserProvisioner do
       expect(existing_user.username).to eq('existing')
       expect(existing_user.custom_fields['logto_sub']).to eq('logto-sub-123')
       expect(existing_user.custom_fields['logto_last_auth']).to be_present
-      expect(Jobs).to have_received(:enqueue).with(:download_avatar_from_url, anything)
+
+      # Check that name change job was enqueued
+      expect(Jobs).to have_received(:enqueue).with(
+        :change_display_name,
+        satisfy { |payload| payload[:new_name] == 'Updated Name' && payload[:old_name] == 'Old Name' }
+      )
+
+      # Check that avatar download was enqueued
+      expect(Jobs).to have_received(:enqueue).with(
+        :download_avatar_from_url,
+        satisfy { |payload| payload[:url] == 'https://cdn.example.com/avatar.png' }
+      )
     end
 
     it 'creates UserAssociatedAccount for existing user without one' do
