@@ -223,13 +223,6 @@ UserAssociatedAccount.create!(
 - TTL: 60 seconds
 - Returns 429 with `retry_after` on exceed
 
-**Also uses Rack::Attack** (if available):
-```ruby
-Rack::Attack.throttle("mobile_session/ip", limit: 10, period: 1.minute) do |req|
-  req.ip if req.path == "/api/auth/mobile-session" && req.post?
-end
-```
-
 ---
 
 ## API Reference

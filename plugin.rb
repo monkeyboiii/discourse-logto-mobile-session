@@ -44,13 +44,6 @@ after_initialize do
     end
   end
 
-  # Add rate limiting for mobile session endpoint
-  if defined?(RackAttack)
-    Rack::Attack.throttle("mobile_session/ip", limit: 10, period: 1.minute) do |req|
-      req.ip if req.path == "/api/auth/mobile-session" && req.post?
-    end
-  end
-
   # Invalidate cached OIDC metadata when relevant settings change
   on(:site_setting_changed) do |setting_name, old_value, new_value|
     case setting_name
