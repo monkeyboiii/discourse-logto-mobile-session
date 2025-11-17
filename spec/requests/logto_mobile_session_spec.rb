@@ -44,6 +44,7 @@ describe "LogtoMobile::SessionController", type: :request do
     SiteSetting.openid_connect_enabled = true
     SiteSetting.logto_mobile_session_enabled = true
     SiteSetting.openid_connect_discovery_document = discovery_url
+    SiteSetting.force_hostname = "forum.example.com"
   end
 
   describe "POST /api/auth/mobile-session" do
