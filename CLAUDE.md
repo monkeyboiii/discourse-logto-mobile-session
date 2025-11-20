@@ -265,7 +265,7 @@ Authorization: Bearer eyJhbGc...
     "username": "johndoe",
     "email": "[email protected]",
     "name": "John Doe",
-    "avatar_url": "https://..."
+    "avatar_template": "https://..."
   },
   "validation_method": "jwt"
 }
@@ -441,12 +441,6 @@ From `user_provisioner.rb:63-64`:
 From `user_provisioner.rb:97`:
 ```ruby
 # TODO: More custom fields here
-```
-
-From `session_controller.rb:62`:
-```ruby
-# TODO: Should probably leave interpolation to the client
-avatar_url: user.avatar_template_url.gsub("{size}", "120")
 ```
 
 ---

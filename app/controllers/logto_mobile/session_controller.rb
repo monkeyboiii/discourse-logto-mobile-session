@@ -27,6 +27,7 @@ module LogtoMobile
       unless validation_result[:success]
         return(
           render json: {
+                   success: false,
                    error: validation_result[:error],
                    message: validation_result[:message],
                  },
@@ -59,8 +60,7 @@ module LogtoMobile
                  username: user.username,
                  email: user.email,
                  name: user.name,
-                 # TODO: Should probably leave interpolation to the client
-                 avatar_url: user.avatar_template_url.gsub("{size}", "120"),
+                 avatar_template: user.avatar_template_url,
                },
                validation_method: validation_result[:validation_method],
              },
